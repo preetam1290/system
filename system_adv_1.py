@@ -2,7 +2,7 @@
 # FIBONACCI ALERT SYSTEM - Simplified Version
 # ============================================================================
 # Author: Preetam
-# Description: Clean Fibonacci retracement alert system for crypto trading
+# Description: alert system for crypto trading
 # ============================================================================
 
 # Core imports
@@ -13,10 +13,9 @@ import json
 import time
 import requests
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+import pytz
 from binance.client import Client
-from collections import deque
-from pytz import timezone
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -51,20 +50,68 @@ class FibonacciAlertSystem:
         self.df = pd.DataFrame()
         self.ws = None
         
+    
         # Core parameters from environment variables
         self.swing_lookback = int(os.getenv('SWING_LOOKBACK', 249))
         self.ema_length = int(os.getenv('EMA_LENGTH', 50))
         
-        # Volume parameters from environment variables
-        self.vol_lookback = int(os.getenv('VOL_LOOKBACK', 30))
-        self.vol_threshold = float(os.getenv('VOL_THRESHOLD', 2.0))
-        self.ml_sensitivity = float(os.getenv('ML_SENSITIVITY', 2.0))
         
         # Alert system parameters from environment variables
-        self.fib_tolerance = float(os.getenv('FIB_TOLERANCE', 0.1))  # Percentage tolerance for Fibonacci level matching
+        self.base_fib_tolerance = float(os.getenv('FIB_TOLERANCE', 0.1))  # Base percentage tolerance for Fibonacci level matching
+        self.fib_tolerance = self.base_fib_tolerance  # Dynamic tolerance (will be adjusted by ATR)
         self.last_fib_alert_time = {}  # Track last alert time for each level
         self.last_ema_alert_time = {}  # Track last alert time for EMA intersections
         self.alert_cooldown = int(os.getenv('ALERT_COOLDOWN', 300))  # 5 minutes cooldown between alerts for same level
+        
+        # ATR-based dynamic tolerance parameters
+        self.atr_period = int(os.getenv('ATR_PERIOD', 14))  # ATR calculation period
+        self.atr_multiplier = float(os.getenv('ATR_MULTIPLIER', 1.5))  # ATR multiplier for dynamic tolerance
+        self.enable_atr_tolerance = os.getenv('ENABLE_ATR_TOLERANCE', 'true').lower() == 'true'
+        
+        # ATR Signal Generation Parameters
+        self.enable_atr_signals = os.getenv('ENABLE_ATR_SIGNALS', 'true').lower() == 'true'
+        self.atr_signal_lookback = int(os.getenv('ATR_SIGNAL_LOOKBACK', 20))  # Lookback for ATR comparison
+        self.atr_expansion_threshold = float(os.getenv('ATR_EXPANSION_THRESHOLD', 1.5))  # ATR expansion multiplier
+        self.atr_contraction_threshold = float(os.getenv('ATR_CONTRACTION_THRESHOLD', 0.7))  # ATR contraction multiplier
+        self.atr_breakout_threshold = float(os.getenv('ATR_BREAKOUT_THRESHOLD', 2.0))  # Strong breakout multiplier
+        self.last_atr_signal_time = {}  # Track last ATR signal time
+        self.atr_signal_cooldown = int(os.getenv('ATR_SIGNAL_COOLDOWN', 180))  # 3 minutes cooldown for ATR signals
+        
+        # ATR-based TP/SL parameters for ETH 5-minute timeframe
+        self.tp_atr_multiplier = float(os.getenv('TP_ATR_MULTIPLIER', 2.0))  # Take profit: 2x ATR
+        self.sl_atr_multiplier = float(os.getenv('SL_ATR_MULTIPLIER', 1.0))  # Stop loss: 1x ATR
+        
+        # Simplified Indian Trading Sessions
+        self.enable_session_awareness = os.getenv('ENABLE_SESSION_AWARENESS', 'true').lower() == 'true'
+        self.session_parameters = {
+            'morning': {
+                'name': '🌅 Morning Session',
+                'ist_start': 9,   # 9:00 AM IST
+                'ist_end': 15,    # 3:00 PM IST
+                'fib_tolerance_multiplier': float(os.getenv('MORNING_FIB_MULT', 1.0)),
+                'alert_cooldown_multiplier': float(os.getenv('MORNING_COOLDOWN_MULT', 1.0)),
+                'description': 'Indian market open + European session'
+            },
+            'evening': {
+                'name': '🌆 Evening Session', 
+                'ist_start': 18,  # 6:00 PM IST
+                'ist_end': 2,     # 2:00 AM IST (next day)
+                'fib_tolerance_multiplier': float(os.getenv('EVENING_FIB_MULT', 1.2)),
+                'alert_cooldown_multiplier': float(os.getenv('EVENING_COOLDOWN_MULT', 0.8)),
+                'description': 'US market active - high volatility'
+            },
+            'night': {
+                'name': '🌙 Night Session',
+                'ist_start': 2,   # 2:00 AM IST
+                'ist_end': 9,     # 9:00 AM IST
+                'fib_tolerance_multiplier': float(os.getenv('NIGHT_FIB_MULT', 0.9)),
+                'alert_cooldown_multiplier': float(os.getenv('NIGHT_COOLDOWN_MULT', 1.3)),
+                'description': 'Asian session - lower volatility'
+            }
+        }
+        
+        self.current_session = 'morning'  # Default session
+        self.last_session_update = 0
         
         # 24/7 Reliability Features from environment variables
         self.max_bars = int(os.getenv('MAX_BARS', 500))  # Keep last 500 bars in DataFrame
@@ -92,10 +139,13 @@ class FibonacciAlertSystem:
         }
         
         print(f"🚀 Initializing 24/7 Advanced Technical Analysis System for {symbol} on {interval} timeframe...")
-        print(f"📊 Fibonacci Alert System Enabled - Tolerance: ±{self.fib_tolerance}%")
+        print(f"📊 Fibonacci Alert System Enabled - Base Tolerance: ±{self.base_fib_tolerance}%")
         print(f"📈 EMA Intersection Alerts Enabled (9, 21, 50 periods)")
         print(f"🔄 Auto-reconnect enabled with {self.max_reconnect_attempts} max attempts")
         print(f"📱 Telegram Alerts: {'Enabled' if self.telegram_config.get('enable_telegram_alerts') else 'Disabled'}")
+        print(f"📊 ATR Dynamic Tolerance: {'Enabled' if self.enable_atr_tolerance else 'Disabled'} (Period: {self.atr_period}, Multiplier: {self.atr_multiplier})")
+        print(f"📈 ATR Signal Generation: {'Enabled' if self.enable_atr_signals else 'Disabled'} (Expansion: {self.atr_expansion_threshold}x, Contraction: {self.atr_contraction_threshold}x)")
+        print(f"🌍 Session-Aware Parameters: {'Enabled' if self.enable_session_awareness else 'Disabled'}")
         
         # Send startup confirmation to Telegram
         self.send_startup_confirmation()
@@ -212,9 +262,554 @@ class FibonacciAlertSystem:
         """Calculate EMA using pandas (no TA-Lib needed)"""
         return prices.ewm(span=period, adjust=False).mean()
     
+    def calculate_atr(self, high, low, close, period=14):
+        """Calculate Average True Range (ATR)"""
+        if len(high) < period + 1:
+            return pd.Series([0] * len(high), index=high.index)
+        
+        # Calculate True Range components
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        
+        # True Range is the maximum of the three
+        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        # ATR is the exponential moving average of True Range
+        atr = true_range.ewm(span=period, adjust=False).mean()
+        return atr
+    
     def calculate_sma(self, prices, period):
         """Calculate Simple Moving Average"""
         return prices.rolling(window=period).mean()
+    
+    def get_current_session(self):
+        """Determine current trading session based on Indian Standard Time (IST)"""
+        if not self.enable_session_awareness:
+            return 'morning'  # Default session
+        
+        # Get current time in IST
+        ist_tz = pytz.timezone('Asia/Kolkata')
+        current_time = datetime.now(ist_tz)
+        ist_hour = current_time.hour
+        
+        # Simple IST-based session determination
+        if 9 <= ist_hour < 15:      # 9:00 AM to 3:00 PM IST - Morning Session
+            return 'morning'
+        elif 18 <= ist_hour or ist_hour < 2:  # 6:00 PM to 2:00 AM IST - Evening Session  
+            return 'evening'
+        else:  # 2:00 AM to 9:00 AM IST - Night Session
+            return 'night'
+    
+    def update_session_parameters(self):
+        """Update parameters based on current trading session"""
+        if not self.enable_session_awareness:
+            return
+        
+        current_time = time.time()
+        # Update session every 5 minutes
+        if current_time - self.last_session_update < 300:
+            return
+        
+        new_session = self.get_current_session()
+        
+        if new_session != self.current_session:
+            self.current_session = new_session
+            session_params = self.session_parameters[new_session]
+            
+            # Update parameters based on session
+            base_tolerance = self.base_fib_tolerance
+            if hasattr(self, 'current_atr_adjustment'):
+                base_tolerance = self.current_atr_adjustment
+            
+            self.fib_tolerance = base_tolerance * session_params['fib_tolerance_multiplier']
+            
+            # Send session change alert
+            self.send_session_change_alert(new_session, session_params)
+            
+        self.last_session_update = current_time
+    
+    def send_session_change_alert(self, session, params):
+        """Send alert when trading session changes (IST-based)"""
+        # Get current IST time
+        ist_tz = pytz.timezone('Asia/Kolkata')
+        current_time = datetime.now(ist_tz)
+        
+        # Session info
+        session_info = {
+            'morning': {
+                'emoji': '🌅',
+                'name': 'Morning Session (9AM-3PM IST)',
+                'market': 'Indian + European markets active'
+            },
+            'evening': {
+                'emoji': '🌆', 
+                'name': 'Evening Session (6PM-2AM IST)',
+                'market': 'US markets active - highest volatility'
+            },
+            'night': {
+                'emoji': '🌙',
+                'name': 'Night Session (2AM-9AM IST)', 
+                'market': 'Asian markets - lower volatility'
+            }
+        }
+        
+        info = session_info[session]
+        
+        title = f"Session Change: {info['emoji']} {session.upper()}"
+        body = f"""{info['emoji']} TRADING SESSION CHANGED!
+
+New Session: {info['name']}
+IST Time: {current_time.strftime('%I:%M %p')}
+Date: {current_time.strftime('%d-%m-%Y')}
+
+🎯 Market Info:
+{info['market']}
+
+⚙️ Adjusted Settings:
+• Fib Tolerance: {params['fib_tolerance_multiplier']}x (±{self.fib_tolerance:.3f}%)
+• Alert Cooldown: {params['alert_cooldown_multiplier']}x
+
+Hey Preetam! Session changed - settings optimized for current market hours! 🚀"""
+        
+        self.dispatch_alert(
+            channel="session",
+            priority="low",
+            title=title,
+            body=body,
+            tag=f"session_{session}"
+        )
+    
+    def update_atr_tolerance(self):
+        """Update Fibonacci tolerance based on ATR (volatility)"""
+        if not self.enable_atr_tolerance or len(self.df) < self.atr_period + 1:
+            return
+        
+        # Calculate ATR
+        if 'atr' not in self.df.columns:
+            self.df['atr'] = self.calculate_atr(self.df['high'], self.df['low'], self.df['close'], self.atr_period)
+        
+        latest_atr = self.df['atr'].iloc[-1]
+        latest_price = self.df['close'].iloc[-1]
+        
+        if pd.isna(latest_atr) or latest_atr == 0 or pd.isna(latest_price) or latest_price == 0:
+            return
+        
+        # Calculate ATR as percentage of current price
+        atr_percentage = (latest_atr / latest_price) * 100
+        
+        # Adjust tolerance based on ATR
+        atr_adjusted_tolerance = self.base_fib_tolerance + (atr_percentage * self.atr_multiplier)
+        
+        # Apply session multiplier if enabled
+        if self.enable_session_awareness:
+            session_params = self.session_parameters[self.current_session]
+            atr_adjusted_tolerance *= session_params['fib_tolerance_multiplier']
+        
+        # Limit tolerance to reasonable bounds (min 0.05%, max 2.0%)
+        self.fib_tolerance = max(0.05, min(2.0, atr_adjusted_tolerance))
+        self.current_atr_adjustment = atr_adjusted_tolerance
+        
+        # Send ATR update alert if tolerance changed significantly
+        tolerance_change = abs(self.fib_tolerance - self.base_fib_tolerance) / self.base_fib_tolerance
+        if tolerance_change > 0.5:  # 50% change threshold
+            self.send_atr_tolerance_alert(latest_atr, atr_percentage, tolerance_change)
+    
+    def send_atr_tolerance_alert(self, atr_value, atr_percentage, tolerance_change):
+        """Send alert when ATR-based tolerance changes significantly"""
+        title = "ATR Tolerance Update"
+        
+        change_direction = "INCREASED" if self.fib_tolerance > self.base_fib_tolerance else "DECREASED"
+        change_emoji = "📈" if change_direction == "INCREASED" else "📉"
+        
+        body = f"""{change_emoji} ATR-Based Tolerance Adjustment!
+
+Market volatility has changed significantly!
+
+📊 Current ATR: ${atr_value:.4f}
+📐 ATR %: {atr_percentage:.3f}% of price
+🎯 Base Tolerance: ±{self.base_fib_tolerance:.3f}%
+🎯 New Dynamic Tolerance: ±{self.fib_tolerance:.3f}%
+📊 Change: {tolerance_change*100:.1f}%
+
+🌍 Current Session: {self.current_session.upper()}
+
+Tolerance has been {change_direction} to adapt to current market volatility!
+
+Hey Preetam! Market volatility adjusted - tolerance updated for better signals!"""
+        
+        priority = "medium" if tolerance_change > 1.0 else "low"
+        
+        self.dispatch_alert(
+            channel="atr",
+            priority=priority,
+            title=title,
+            body=body,
+            tag="atr_tolerance_update"
+        )
+    
+    def generate_atr_signals(self):
+        """Generate trading signals based on ATR levels and volatility analysis"""
+        if not self.enable_atr_signals or len(self.df) < self.atr_signal_lookback + self.atr_period:
+            return
+        
+        if 'atr' not in self.df.columns:
+            return
+        
+        current_time = time.time()
+        latest = self.df.iloc[-1]
+        current_atr = latest['atr']
+        current_price = latest['close']
+        
+        if pd.isna(current_atr) or current_atr == 0:
+            return
+        
+        # Calculate ATR statistics for signal generation
+        atr_series = self.df['atr'].tail(self.atr_signal_lookback)
+        atr_mean = atr_series.mean()
+        atr_std = atr_series.std()
+        
+        if pd.isna(atr_mean) or pd.isna(atr_std) or atr_mean == 0:
+            return
+        
+        # ATR as percentage of price for normalization
+        atr_percentage = (current_atr / current_price) * 100
+        atr_mean_percentage = (atr_mean / current_price) * 100
+        
+        # Calculate ATR z-score (how many standard deviations from mean)
+        atr_zscore = (current_atr - atr_mean) / atr_std if atr_std > 0 else 0
+        
+        # Store ATR metrics in DataFrame for analysis
+        self.df.loc[self.df.index[-1], 'atr_mean'] = atr_mean
+        self.df.loc[self.df.index[-1], 'atr_zscore'] = atr_zscore
+        self.df.loc[self.df.index[-1], 'atr_percentage'] = atr_percentage
+        
+        # Generate different types of ATR signals
+        signals = []
+        
+        # 1. ATR EXPANSION SIGNAL (Volatility Increasing)
+        if current_atr > atr_mean * self.atr_expansion_threshold:
+            signal_key = 'atr_expansion'
+            if (signal_key not in self.last_atr_signal_time or 
+                current_time - self.last_atr_signal_time[signal_key] > self.atr_signal_cooldown):
+                
+                self.send_atr_expansion_signal(current_atr, atr_mean, atr_percentage, atr_zscore)
+                self.last_atr_signal_time[signal_key] = current_time
+                signals.append('ATR_EXPANSION')
+        
+        # 2. ATR CONTRACTION SIGNAL (Volatility Decreasing)
+        elif current_atr < atr_mean * self.atr_contraction_threshold:
+            signal_key = 'atr_contraction'
+            if (signal_key not in self.last_atr_signal_time or 
+                current_time - self.last_atr_signal_time[signal_key] > self.atr_signal_cooldown):
+                
+                self.send_atr_contraction_signal(current_atr, atr_mean, atr_percentage, atr_zscore)
+                self.last_atr_signal_time[signal_key] = current_time
+                signals.append('ATR_CONTRACTION')
+        
+        # 3. EXTREME VOLATILITY BREAKOUT (Very High ATR)
+        if current_atr > atr_mean * self.atr_breakout_threshold and atr_zscore > 2.0:
+            signal_key = 'atr_breakout'
+            if (signal_key not in self.last_atr_signal_time or 
+                current_time - self.last_atr_signal_time[signal_key] > self.atr_signal_cooldown):
+                
+                self.send_atr_breakout_signal(current_atr, atr_mean, atr_percentage, atr_zscore)
+                self.last_atr_signal_time[signal_key] = current_time
+                signals.append('ATR_BREAKOUT')
+        
+        # 4. ATR SQUEEZE SETUP (Very Low Volatility - Potential Breakout Setup)
+        elif atr_zscore < -1.5 and current_atr < atr_mean * 0.6:
+            signal_key = 'atr_squeeze'
+            if (signal_key not in self.last_atr_signal_time or 
+                current_time - self.last_atr_signal_time[signal_key] > self.atr_signal_cooldown * 2):  # Longer cooldown for squeeze
+                
+                self.send_atr_squeeze_signal(current_atr, atr_mean, atr_percentage, atr_zscore)
+                self.last_atr_signal_time[signal_key] = current_time
+                signals.append('ATR_SQUEEZE')
+        
+        # 5. ATR TREND SIGNALS (Combined with price action)
+        self.generate_atr_trend_signals(current_atr, atr_mean, atr_percentage, current_time)
+        
+        return signals
+    
+    def calculate_tp_sl_levels(self, current_price, current_atr, signal_direction):
+        """Calculate TP and SL levels based on ATR for ETH 5min"""
+        # Use current ATR for calculations
+        atr_value = current_atr
+        
+        if signal_direction == 'LONG':
+            # Long position
+            stop_loss = current_price - (atr_value * self.sl_atr_multiplier)
+            take_profit = current_price + (atr_value * self.tp_atr_multiplier)
+        else:
+            # Short position  
+            stop_loss = current_price + (atr_value * self.sl_atr_multiplier)
+            take_profit = current_price - (atr_value * self.tp_atr_multiplier)
+        
+        # Calculate risk/reward ratio
+        risk = abs(current_price - stop_loss)
+        reward = abs(take_profit - current_price)
+        rr_ratio = reward / risk if risk > 0 else 0
+        
+        return {
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'risk': risk,
+            'reward': reward,
+            'rr_ratio': rr_ratio
+        }
+    
+    def send_atr_expansion_signal(self, current_atr, atr_mean, atr_percentage, atr_zscore):
+        """Send simplified ATR expansion signal with TP/SL"""
+        current_price = self.df['close'].iloc[-1]
+        
+        # Determine signal direction based on recent price action
+        price_change_5 = self.df['close'].iloc[-1] - self.df['close'].iloc[-6]  # 5 periods ago
+        signal_direction = 'LONG' if price_change_5 > 0 else 'SHORT'
+        
+        # Calculate TP/SL levels
+        levels = self.calculate_tp_sl_levels(current_price, current_atr, signal_direction)
+        
+        title = "ATR Expansion Signal"
+        
+        body = f"""ATR EXPANSION - {signal_direction} SIGNAL
+
+Price: ${current_price:.2f}
+ATR: ${current_atr:.2f} ({(current_atr/atr_mean):.1f}x avg)
+Direction: {signal_direction}
+
+Trade Setup:
+Entry: ${current_price:.2f}
+Stop Loss: ${levels['stop_loss']:.2f}
+Take Profit: ${levels['take_profit']:.2f}
+Risk: ${levels['risk']:.2f}
+Reward: ${levels['reward']:.2f}
+R/R: {levels['rr_ratio']:.1f}
+
+Session: {self.current_session.upper()}"""
+        
+        priority = "high" if atr_zscore > 2.0 else "medium"
+        
+        self.dispatch_alert(
+            channel="atr_signals",
+            priority=priority,
+            title=title,
+            body=body,
+            tag="atr_expansion"
+        )
+    
+    def send_atr_contraction_signal(self, current_atr, atr_mean, atr_percentage, atr_zscore):
+        """Send ATR contraction signal (volatility decreasing)"""
+        title = "📉 ATR Contraction Signal"
+        
+        body = f"""📉 VOLATILITY CONTRACTION DETECTED
+
+📊 Market volatility is decreasing
+
+📈 Current ATR: ${current_atr:.4f}
+📊 Average ATR: ${atr_mean:.4f}
+📐 ATR %: {atr_percentage:.3f}% of price
+🎯 Z-Score: {atr_zscore:.2f}
+📏 Contraction: {(current_atr/atr_mean):.2f}x average
+
+🌍 Session: {self.current_session.upper()}
+
+💡 SIGNAL IMPLICATIONS:
+• Smaller price movements expected
+• Range-bound trading likely
+• Tighter stop losses appropriate
+• Look for consolidation patterns
+
+Hey Preetam! Market is calming down - range trading mode! 📊"""
+        
+        self.dispatch_alert(
+            channel="atr_signals",
+            priority="low",
+            title=title,
+            body=body,
+            tag="atr_contraction"
+        )
+    
+    def send_atr_breakout_signal(self, current_atr, atr_mean, atr_percentage, atr_zscore):
+        """Send extreme volatility breakout signal"""
+        title = "🚨 EXTREME VOLATILITY BREAKOUT!"
+        
+        body = f"""🚨 EXTREME VOLATILITY BREAKOUT! 🚨
+
+⚡ MAJOR MARKET MOVEMENT DETECTED!
+
+🔥 Current ATR: ${current_atr:.4f}
+📊 Average ATR: ${atr_mean:.4f}
+📐 ATR %: {atr_percentage:.3f}% of price
+🎯 Z-Score: {atr_zscore:.2f} (EXTREME!)
+📏 Breakout: {(current_atr/atr_mean):.2f}x average
+
+🌍 Session: {self.current_session.upper()}
+
+🚨 CRITICAL IMPLICATIONS:
+• MAJOR trend change likely in progress
+• Massive price movements expected
+• Old support/resistance may break
+• High momentum trading opportunity
+• Use very wide stops or no stops initially
+
+🔴 IMMEDIATE ACTION REQUIRED!
+Hey Preetam! This is a MAJOR volatility event - check charts NOW! 🚨"""
+        
+        self.dispatch_alert(
+            channel="atr_signals",
+            priority="critical",
+            title=title,
+            body=body,
+            tag="atr_extreme_breakout"
+        )
+    
+    def send_atr_squeeze_signal(self, current_atr, atr_mean, atr_percentage, atr_zscore):
+        """Send ATR squeeze signal (potential breakout setup)"""
+        title = "⚡ ATR Squeeze Setup"
+        
+        body = f"""⚡ VOLATILITY SQUEEZE DETECTED ⚡
+
+🎯 Potential breakout setup forming!
+
+📈 Current ATR: ${current_atr:.4f}
+📊 Average ATR: ${atr_mean:.4f}
+📐 ATR %: {atr_percentage:.3f}% of price
+🎯 Z-Score: {atr_zscore:.2f} (Very Low!)
+📏 Squeeze: {(current_atr/atr_mean):.2f}x average
+
+🌍 Session: {self.current_session.upper()}
+
+💡 SETUP IMPLICATIONS:
+• Market coiling for potential breakout
+• Low volatility often precedes big moves
+• Look for consolidation patterns
+• Prepare for directional breakout
+• Good risk/reward setups possible
+
+⏰ WATCH FOR:
+• Range breakouts
+• Momentum acceleration
+• Price pattern confirmation
+
+Hey Preetam! Market is squeezing - big move coming! Get ready! ⚡"""
+        
+        self.dispatch_alert(
+            channel="atr_signals",
+            priority="medium",
+            title=title,
+            body=body,
+            tag="atr_squeeze_setup"
+        )
+    
+    def generate_atr_trend_signals(self, current_atr, atr_mean, atr_percentage, current_time):
+        """Generate ATR-based trend signals combined with price action"""
+        if len(self.df) < 5:
+            return
+        
+        latest = self.df.iloc[-1]
+        previous = self.df.iloc[-2]
+        
+        current_price = latest['close']
+        previous_price = previous['close']
+        price_change = current_price - previous_price
+        price_change_pct = (price_change / previous_price) * 100
+        
+        # ATR Momentum Signal (High ATR + Strong Price Move)
+        if (current_atr > atr_mean * 1.3 and abs(price_change_pct) > atr_percentage * 0.5):
+            signal_key = f'atr_momentum_{"bull" if price_change > 0 else "bear"}'
+            if (signal_key not in self.last_atr_signal_time or 
+                current_time - self.last_atr_signal_time[signal_key] > self.atr_signal_cooldown):
+                
+                self.send_atr_momentum_signal(current_atr, atr_mean, price_change_pct, price_change > 0)
+                self.last_atr_signal_time[signal_key] = current_time
+        
+        # ATR Reversal Signal (High ATR + Price rejection)
+        if hasattr(latest, 'ema_21') and not pd.isna(latest['ema_21']):
+            ema_21 = latest['ema_21']
+            wick_size = max(latest['high'] - max(latest['open'], latest['close']), 
+                          min(latest['open'], latest['close']) - latest['low'])
+            
+            if (current_atr > atr_mean * 1.2 and wick_size > current_atr * 0.5):
+                reversal_direction = "bullish" if latest['close'] > ema_21 and latest['low'] < ema_21 else "bearish"
+                if latest['close'] < ema_21 and latest['high'] > ema_21:
+                    reversal_direction = "bearish"
+                
+                signal_key = f'atr_reversal_{reversal_direction}'
+                if (signal_key not in self.last_atr_signal_time or 
+                    current_time - self.last_atr_signal_time[signal_key] > self.atr_signal_cooldown * 1.5):
+                    
+                    self.send_atr_reversal_signal(current_atr, atr_mean, wick_size, reversal_direction)
+                    self.last_atr_signal_time[signal_key] = current_time
+    
+    def send_atr_momentum_signal(self, current_atr, atr_mean, price_change_pct, is_bullish):
+        """Send ATR momentum signal"""
+        direction = "BULLISH" if is_bullish else "BEARISH"
+        emoji = "🚀" if is_bullish else "🐻"
+        title = f"{emoji} ATR Momentum Signal - {direction}"
+        
+        body = f"""{emoji} ATR MOMENTUM SIGNAL {emoji}
+
+📊 High volatility + strong price move detected!
+
+📈 Direction: {direction}
+💰 Price Change: {price_change_pct:+.3f}%
+📊 Current ATR: ${current_atr:.4f}
+📊 Average ATR: ${atr_mean:.4f}
+📏 ATR Ratio: {(current_atr/atr_mean):.2f}x
+
+🌍 Session: {self.current_session.upper()}
+
+💡 MOMENTUM SIGNAL:
+• Strong {direction.lower()} momentum confirmed
+• High volatility supporting move
+• Trend continuation likely
+• {'Consider long positions' if is_bullish else 'Consider short positions'}
+
+Hey Preetam! Strong {direction.lower()} momentum with high volatility! {emoji}"""
+        
+        priority = "high" if abs(price_change_pct) > 2.0 else "medium"
+        
+        self.dispatch_alert(
+            channel="atr_signals",
+            priority=priority,
+            title=title,
+            body=body,
+            tag=f"atr_momentum_{direction.lower()}"
+        )
+    
+    def send_atr_reversal_signal(self, current_atr, atr_mean, wick_size, reversal_direction):
+        """Send ATR reversal signal"""
+        emoji = "🔄" if reversal_direction == "bullish" else "🔄"
+        title = f"{emoji} ATR Reversal Signal - {reversal_direction.upper()}"
+        
+        body = f"""{emoji} ATR REVERSAL SIGNAL {emoji}
+
+🎯 High volatility rejection detected!
+
+📊 Direction: {reversal_direction.upper()} REVERSAL
+📏 Rejection Wick: ${wick_size:.4f}
+📊 Current ATR: ${current_atr:.4f}
+📊 Average ATR: ${atr_mean:.4f}
+📏 Wick/ATR Ratio: {(wick_size/current_atr):.2f}x
+
+🌍 Session: {self.current_session.upper()}
+
+💡 REVERSAL SIGNAL:
+• Strong rejection at key level
+• High volatility confirming reversal
+• Potential trend change setup
+• Look for confirmation on next candle
+
+Hey Preetam! Potential {reversal_direction} reversal with high volatility! 🔄"""
+        
+        self.dispatch_alert(
+            channel="atr_signals",
+            priority="medium",
+            title=title,
+            body=body,
+            tag=f"atr_reversal_{reversal_direction}"
+        )
         
     def get_historical_data(self, limit=500):
         """Get historical kline data from Binance"""
@@ -230,8 +825,7 @@ class FibonacciAlertSystem:
                     'open': float(kline[1]),
                     'high': float(kline[2]),
                     'low': float(kline[3]),
-                    'close': float(kline[4]),
-                    'volume': float(kline[5])
+                    'close': float(kline[4])
                 })
             
             self.df = pd.DataFrame(data)
@@ -241,115 +835,9 @@ class FibonacciAlertSystem:
             
         except Exception as e:
             print(f"Error getting historical data: {e}")
-            return False
+            return False  
 
-    def calculate_volume_ml_indicators(self):
-        """Calculate Volume ML indicators matching Pine Script logic"""
-        if len(self.df) < self.vol_lookback:
-            return
         
-        # Basic volume statistics
-        self.df['vol_avg'] = self.df['volume'].rolling(window=self.vol_lookback).mean()
-        self.df['vol_std'] = self.df['volume'].rolling(window=self.vol_lookback).std()
-        self.df['vol_normalized'] = (self.df['volume'] - self.df['vol_avg']) / self.df['vol_std']
-        
-        # Price and volume changes
-        self.df['price_change'] = self.df['close'].diff()
-        self.df['volume_change'] = self.df['volume'].diff()
-        
-        # Volume-Price correlation
-        self.df['vp_correlation'] = self.df['price_change'].rolling(20).corr(self.df['volume_change'])
-        
-        # Volume RSI and EMAs (using custom functions)
-        self.df['vol_rsi'] = self.calculate_rsi(self.df['volume'], 14)
-        self.df['vol_ema_short'] = self.calculate_ema(self.df['volume'], 8)
-        self.df['vol_ema_long'] = self.calculate_ema(self.df['volume'], 21)
-        self.df['vol_momentum'] = ((self.df['vol_ema_short'] - self.df['vol_ema_long']) / self.df['vol_ema_long']) * 100
-        
-        # Volume patterns
-        self.df['vol_spike'] = self.df['volume'] > (self.df['vol_avg'] * self.vol_threshold)
-        self.df['vol_dry_up'] = self.df['volume'] < (self.df['vol_avg'] * 0.5)
-        self.df['vol_increasing'] = (self.df['volume'] > self.df['volume'].shift(1)) & (self.df['volume'].shift(1) > self.df['volume'].shift(2))
-        self.df['vol_decreasing'] = (self.df['volume'] < self.df['volume'].shift(1)) & (self.df['volume'].shift(1) < self.df['volume'].shift(2))
-        
-        # Smart Money Flow Analysis
-        hlc2 = (self.df['high'] + self.df['low']) / 2
-        self.df['buying_pressure'] = np.where(self.df['close'] > hlc2, self.df['volume'], 0)
-        self.df['selling_pressure'] = np.where(self.df['close'] < hlc2, self.df['volume'], 0)
-        
-        self.df['smart_money_flow'] = (self.df['buying_pressure'] - self.df['selling_pressure']).rolling(21).mean()
-        self.df['smart_money_ratio'] = (self.df['smart_money_flow'] / self.df['vol_avg']) * 100
-        
-        # VWAP and deviation (cumulative calculation reset daily)
-        hlc3 = (self.df['high'] + self.df['low'] + self.df['close']) / 3
-        
-        # Simple VWAP calculation (you might want to reset this daily in production)
-        cumulative_volume = self.df['volume'].cumsum()
-        cumulative_vol_price = (hlc3 * self.df['volume']).cumsum()
-        self.df['vwap'] = cumulative_vol_price / cumulative_volume
-        
-        # For a more accurate daily VWAP, you'd need to reset at market open
-        # Here's a rolling VWAP approximation for the last 100 periods
-        rolling_periods = min(100, len(self.df))
-        rolling_vol_price = (hlc3 * self.df['volume']).rolling(rolling_periods).sum()
-        rolling_volume = self.df['volume'].rolling(rolling_periods).sum()
-        self.df['vwap'] = rolling_vol_price / rolling_volume
-        
-        self.df['vwap_deviation'] = ((self.df['close'] - self.df['vwap']) / self.df['vwap']) * 100
-        
-    def calculate_volume_ml_score(self):
-        """Calculate Volume ML Score matching Pine Script logic"""
-        if len(self.df) == 0:
-            return
-        
-        vol_ml_score = pd.Series(0.0, index=self.df.index)
-        
-        # Volume spike analysis
-        condition1 = self.df['vol_spike'] & (self.df['price_change'] > 0)
-        condition2 = self.df['vol_spike'] & (self.df['price_change'] < 0)
-        vol_ml_score = np.where(condition1, vol_ml_score + 30, vol_ml_score)
-        vol_ml_score = np.where(condition2, vol_ml_score - 25, vol_ml_score)
-        
-        # Volume momentum
-        condition3 = self.df['vol_momentum'] > 10
-        condition4 = self.df['vol_momentum'] < -10
-        vol_ml_score = np.where(condition3, vol_ml_score + 20, vol_ml_score)
-        vol_ml_score = np.where(condition4, vol_ml_score - 15, vol_ml_score)
-        
-        # Smart money flow
-        condition5 = self.df['smart_money_ratio'] > 5
-        condition6 = self.df['smart_money_ratio'] < -5
-        vol_ml_score = np.where(condition5, vol_ml_score + 25, vol_ml_score)
-        vol_ml_score = np.where(condition6, vol_ml_score - 20, vol_ml_score)
-        
-        # Volume-price correlation
-        condition7 = self.df['vp_correlation'] > 0.3
-        condition8 = self.df['vp_correlation'] < -0.3
-        vol_ml_score = np.where(condition7, vol_ml_score + 15, vol_ml_score)
-        vol_ml_score = np.where(condition8, vol_ml_score - 10, vol_ml_score)
-        
-        # VWAP analysis
-        condition9 = (self.df['close'] > self.df['vwap']) & (self.df['volume'] > self.df['vol_avg'])
-        condition10 = (self.df['close'] < self.df['vwap']) & (self.df['volume'] > self.df['vol_avg'])
-        vol_ml_score = np.where(condition9, vol_ml_score + 10, vol_ml_score)
-        vol_ml_score = np.where(condition10, vol_ml_score - 10, vol_ml_score)
-        
-        # Volume pattern recognition
-        condition11 = self.df['vol_increasing'] & (self.df['price_change'] > 0)
-        condition12 = self.df['vol_decreasing'] & (self.df['price_change'] < 0)
-        vol_ml_score = np.where(condition11, vol_ml_score + 15, vol_ml_score)
-        vol_ml_score = np.where(condition12, vol_ml_score - 10, vol_ml_score)
-        
-        # Apply ML sensitivity
-        vol_ml_score = vol_ml_score * self.ml_sensitivity
-        
-        self.df['vol_ml_score'] = vol_ml_score
-        
-        # Volume trend classification
-        self.df['vol_trend'] = np.where(
-            self.df['vol_ml_score'] > 30, 'ACCUMULATION',
-            np.where(self.df['vol_ml_score'] < -30, 'DISTRIBUTION', 'NEUTRAL')
-        )
     
     def calculate_fibonacci_levels(self):
         """Calculate Fibonacci retracement levels (Magic Zone Strategy)"""
@@ -372,6 +860,15 @@ class FibonacciAlertSystem:
         
         # Calculate RSI with period 9
         self.df['rsi'] = self.calculate_rsi(self.df['close'], 9)
+        
+        # Update ATR-based tolerance
+        self.update_atr_tolerance()
+        
+        # Update session-aware parameters
+        self.update_session_parameters()
+        
+        # Generate ATR-based signals
+        self.generate_atr_signals()
     
     def check_fibonacci_alerts(self):
         """Check if current price matches Fibonacci levels and send alerts"""
@@ -454,11 +951,18 @@ Difference: ${difference:.4f}
 Price is {position} Fibonacci {fib_level}"""
         
         # Dispatch alert through multi-channel system
+        # Add session and ATR info to alert
+        enhanced_text = formatted_text + f"\n\n🌍 Session: {self.current_session.upper()}"
+        if self.enable_atr_tolerance:
+            atr_value = self.df['atr'].iloc[-1] if 'atr' in self.df.columns and not pd.isna(self.df['atr'].iloc[-1]) else 0
+            enhanced_text += f"\n📊 ATR: ${atr_value:.4f}"
+        enhanced_text += f"\n🎯 Dynamic Tolerance: ±{self.fib_tolerance:.3f}%"
+        
         self.dispatch_alert(
             channel="fibonacci",
             priority=priority,
             title=title,
-            body=formatted_text,
+            body=enhanced_text,
             tag=f"fib_{fib_level.replace('.', '').replace('%', '')}"
         )
     
@@ -665,12 +1169,18 @@ EMA Values:
 
 Time to check the charts! 📊"""
         
+        # Add session and ATR info to alert
+        enhanced_text = formatted_text + f"\n\n🌍 Current Session: {self.current_session.upper()}"
+        if self.enable_atr_tolerance:
+            atr_value = self.df['atr'].iloc[-1] if 'atr' in self.df.columns and not pd.isna(self.df['atr'].iloc[-1]) else 0
+            enhanced_text += f"\n📊 Current ATR: ${atr_value:.4f}"
+        
         # Dispatch alert through multi-channel system
         self.dispatch_alert(
             channel="ema_intersection",
             priority=priority,
             title=title,
-            body=formatted_text,
+            body=enhanced_text,
             tag=f"ema_{trend.lower()}"
         )
     
@@ -692,7 +1202,7 @@ Time to check the charts! 📊"""
 📋 Active Monitoring:
 • 📊 Fibonacci Levels (59.5% & 65.0%)
 • 📈 EMA Crossovers (9, 21, 50)
-• 📊 Volume Analysis & ML Scoring
+• 📊 ATR-based Volatility Signals
 • 🎯 Technical Confluence Signals
 
 ⚙️ Settings:
@@ -703,7 +1213,7 @@ Time to check the charts! 📊"""
 🔔 You will receive alerts for:
 ✓ Fibonacci level hits
 ✓ EMA intersections
-✓ Volume anomalies
+✓ ATR volatility signals
 ✓ High confluence signals
 
 System is now monitoring live data! 📈📉"""
@@ -749,9 +1259,6 @@ System is now monitoring live data! 📈📉"""
         confluence_score = np.where(market_structure == 1, confluence_score + 10, confluence_score)
         confluence_score = np.where(market_structure == -1, confluence_score - 10, confluence_score)
         
-        # Volume confluence
-        confluence_score = np.where(self.df['vol_ml_score'] > 20, confluence_score + 20, confluence_score)
-        confluence_score = np.where(self.df['vol_ml_score'] < -20, confluence_score - 15, confluence_score)
         
         self.df['confluence_score'] = confluence_score
     
@@ -767,20 +1274,6 @@ System is now monitoring live data! 📈📉"""
         def safe_round(value, decimals=2):
             return round(float(value), decimals) if pd.notna(value) else 0.0
         
-        # Volume analysis
-        vol_ratio = latest['volume'] / latest['vol_avg'] if pd.notna(latest['vol_avg']) and latest['vol_avg'] > 0 else 0
-        vol_ratio_status = 'HIGH' if vol_ratio > 1.5 else 'LOW' if vol_ratio < 0.5 else 'NORMAL'
-        
-        vol_rsi_status = 'OVERBOUGHT' if pd.notna(latest['vol_rsi']) and latest['vol_rsi'] > 70 else 'OVERSOLD' if pd.notna(latest['vol_rsi']) and latest['vol_rsi'] < 30 else 'NEUTRAL'
-        
-        vol_momentum_status = 'BULLISH' if pd.notna(latest['vol_momentum']) and latest['vol_momentum'] > 10 else 'BEARISH' if pd.notna(latest['vol_momentum']) and latest['vol_momentum'] < -10 else 'NEUTRAL'
-        
-        smart_money_status = 'BUYING' if pd.notna(latest['smart_money_ratio']) and latest['smart_money_ratio'] > 5 else 'SELLING' if pd.notna(latest['smart_money_ratio']) and latest['smart_money_ratio'] < -5 else 'NEUTRAL'
-        
-        vp_correlation_status = 'STRONG +' if pd.notna(latest['vp_correlation']) and latest['vp_correlation'] > 0.3 else 'STRONG -' if pd.notna(latest['vp_correlation']) and latest['vp_correlation'] < -0.3 else 'WEAK'
-        
-        vwap_dev_status = 'ABOVE' if pd.notna(latest['vwap_deviation']) and latest['vwap_deviation'] > 1 else 'BELOW' if pd.notna(latest['vwap_deviation']) and latest['vwap_deviation'] < -1 else 'NEUTRAL'
-        
         # RSI analysis
         rsi_value = safe_round(latest['rsi'], 1)
         if rsi_value >= 70:
@@ -790,45 +1283,16 @@ System is now monitoring live data! 📈📉"""
         else:
             rsi_status = 'NEUTRAL'
         
-        # Volume pattern
-        if pd.notna(latest['vol_spike']) and latest['vol_spike']:
-            vol_pattern = 'SPIKE'
-        elif pd.notna(latest['vol_dry_up']) and latest['vol_dry_up']:
-            vol_pattern = 'DRY UP'
-        elif pd.notna(latest['vol_increasing']) and latest['vol_increasing']:
-            vol_pattern = 'RISING'
-        elif pd.notna(latest['vol_decreasing']) and latest['vol_decreasing']:
-            vol_pattern = 'FALLING'
-        else:
-            vol_pattern = 'STABLE'
         
         analysis = {
             'timestamp': current_time,
             'price': safe_round(latest['close']),
-            'volume_analysis': {
-                'vol_ratio': safe_round(vol_ratio, 2),
-                'vol_ratio_status': vol_ratio_status,
-                'vol_rsi': safe_round(latest['vol_rsi'], 1),
-                'vol_rsi_status': vol_rsi_status,
-                'vol_momentum': safe_round(latest['vol_momentum'], 1),
-                'vol_momentum_status': vol_momentum_status,
-                'smart_money_ratio': safe_round(latest['smart_money_ratio'], 1),
-                'smart_money_status': smart_money_status,
-                'vp_correlation': safe_round(latest['vp_correlation'], 2),
-                'vp_correlation_status': vp_correlation_status,
-                'vwap_deviation': safe_round(latest['vwap_deviation'], 2),
-                'vwap_dev_status': vwap_dev_status,
-                'vol_pattern': vol_pattern,
-                'vol_ml_score': safe_round(latest['vol_ml_score'], 0),
-                'vol_trend': latest['vol_trend'] if pd.notna(latest['vol_trend']) else 'NEUTRAL'
-            },
             'technical_levels': {
                 'ema_9': safe_round(latest['ema_9'], 2),
                 'ema_21': safe_round(latest['ema_21'], 2),
                 'ema_50': safe_round(latest['ema_50'], 2),
                 'fib_595': safe_round(latest['fib_595'], 2),
                 'fib_650': safe_round(latest['fib_650'], 2),
-                'vwap': safe_round(latest['vwap'], 2),
                 'rsi': rsi_value,
                 'rsi_status': rsi_status
             },
@@ -850,8 +1314,7 @@ System is now monitoring live data! 📈📉"""
                     'open': float(kline['o']),
                     'high': float(kline['h']),
                     'low': float(kline['l']),
-                    'close': float(kline['c']),
-                    'volume': float(kline['v'])
+                    'close': float(kline['c'])
                 }
                 
                 # Add new data to DataFrame
@@ -864,9 +1327,7 @@ System is now monitoring live data! 📈📉"""
                     self.df = self.df.tail(self.max_bars)
                 
                 # Recalculate all indicators
-                self.calculate_volume_ml_indicators()
-                self.calculate_volume_ml_score()
-                self.calculate_fibonacci_levels()
+                self.calculate_fibonacci_levels()  # This includes ATR and session updates
                 self.calculate_confluence_score()
                 
                 # Check for Fibonacci alerts
@@ -903,16 +1364,6 @@ System is now monitoring live data! 📈📉"""
         print(f"Price: ${analysis['price']:.2f}")
         print("="*80)
         
-        print("\nVOLUME ML ANALYSIS:")
-        vol = analysis['volume_analysis']
-        print(f"  Vol Ratio: {vol['vol_ratio']} ({vol['vol_ratio_status']})")
-        print(f"  Vol RSI: {vol['vol_rsi']} ({vol['vol_rsi_status']})")
-        print(f"  Vol Momentum: {vol['vol_momentum']}% ({vol['vol_momentum_status']})")
-        print(f"  Smart Money: {vol['smart_money_ratio']}% ({vol['smart_money_status']})")
-        print(f"  VP Correlation: {vol['vp_correlation']} ({vol['vp_correlation_status']})")
-        print(f"  VWAP Deviation: {vol['vwap_deviation']}% ({vol['vwap_dev_status']})")
-        print(f"  Volume Pattern: {vol['vol_pattern']}")
-        print(f"  ML Score: {vol['vol_ml_score']} ({vol['vol_trend']})")
         
         print(f"\nTECHNICAL LEVELS:")
         levels = analysis['technical_levels']
@@ -921,7 +1372,6 @@ System is now monitoring live data! 📈📉"""
         print(f"  EMA 50: ${levels['ema_50']:.2f}")
         print(f"  Fibonacci 59.5%: ${levels['fib_595']:.2f}")
         print(f"  Fibonacci 65.0%: ${levels['fib_650']:.2f}")
-        print(f"  VWAP: ${levels['vwap']:.2f}")
         print(f"  RSI(9): {levels['rsi']} ({levels['rsi_status']})")
         
         print(f"\nCONFLUENCE SCORE: {analysis['confluence_score']}")
@@ -935,23 +1385,6 @@ System is now monitoring live data! 📈📉"""
         print(f"  Distance to 59.5%: ${fib_595_distance:.4f}")
         print(f"  Distance to 65.0%: ${fib_650_distance:.4f}")
         
-        # Check for volume alerts
-        if vol['vol_ml_score'] > 50:
-            self.dispatch_alert(
-                channel="volume",
-                priority="high",
-                title="Strong Volume Accumulation",
-                body=f"Volume ML Score: {vol['vol_ml_score']}\nVolume Trend: {vol['vol_trend']}\nPattern: {vol['vol_pattern']}",
-                tag="vol_accumulation"
-            )
-        elif vol['vol_ml_score'] < -50:
-            self.dispatch_alert(
-                channel="volume",
-                priority="high",
-                title="Strong Volume Distribution",
-                body=f"Volume ML Score: {vol['vol_ml_score']}\nVolume Trend: {vol['vol_trend']}\nPattern: {vol['vol_pattern']}",
-                tag="vol_distribution"
-            )
         
         # Check for confluence alerts
         if analysis['confluence_score'] > 70:
@@ -979,8 +1412,6 @@ System is now monitoring live data! 📈📉"""
             return
         
         # Calculate initial indicators
-        self.calculate_volume_ml_indicators()
-        self.calculate_volume_ml_score()
         self.calculate_fibonacci_levels()
         self.calculate_confluence_score()
         
@@ -1015,7 +1446,7 @@ System is now monitoring live data! 📈📉"""
         self.ws.run_forever()
 
 # Production usage
-if __name__ == "__main__":
+if __name__ == "__main__": 
     print("🔧 Loading configuration from environment variables...")
     
     # Initialize the analysis system using environment variables
